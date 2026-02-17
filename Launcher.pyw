@@ -596,4 +596,5 @@ try:
     root.mainloop()
 except Exception as e:
     messagebox.showerror("Launcher Fehler", str(e))
+
     raise
