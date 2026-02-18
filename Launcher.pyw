@@ -22,6 +22,11 @@ except Exception as e:
 minecraft_process = None
 logging_enabled = False
 
+# Caches
+icon_cache = {}      # project_id -> PhotoImage
+versions_cache = {}  # project_id -> versions JSON
+page_cache = {}      # (category, query, page) -> data JSON
+
 # ---------------------------
 #  LOG-FUNKTION MIT FARBEN
 # ---------------------------
@@ -87,10 +92,10 @@ def start_minecraft():
 
     # Loader suchen
     loader = None
-    for root, dirs, files in os.walk(os.path.join(mc_dir, "libraries")):
+    for root_dir, dirs, files in os.walk(os.path.join(mc_dir, "libraries")):
         for f in files:
             if f.startswith("fabric-loader-") and f.endswith(".jar"):
-                loader = os.path.join(root, f)
+                loader = os.path.join(root_dir, f)
                 break
         if loader:
             break
@@ -110,10 +115,10 @@ def start_minecraft():
 
     # Classpath bauen
     libs = []
-    for root, dirs, files in os.walk(os.path.join(mc_dir, "libraries")):
+    for root_dir, dirs, files in os.walk(os.path.join(mc_dir, "libraries")):
         for f in files:
             if f.endswith(".jar"):
-                libs.append(os.path.join(root, f))
+                libs.append(os.path.join(root_dir, f))
 
     cp = ";".join([loader, mcjar] + libs)
 
@@ -189,6 +194,37 @@ def toggle_logs():
         log("✔ Logs aktiviert")
     else:
         show_content_list()
+
+# ---------------------------
+#  ICON LADE-FUNKTION (mit Cache + Thread)
+# ---------------------------
+def load_icon_async(project_id, icon_url, label):
+    if project_id in icon_cache:
+        # Direkt aus Cache
+        img_tk = icon_cache[project_id]
+        label.config(image=img_tk)
+        label.image = img_tk
+        return
+
+    def worker():
+        img_tk_local = None
+        if icon_url:
+            try:
+                img_data = requests.get(icon_url, timeout=10).content
+                img = Image.open(BytesIO(img_data)).resize((64, 64))
+                img_tk_local = ImageTk.PhotoImage(img)
+            except:
+                img_tk_local = None
+
+        def apply():
+            if img_tk_local:
+                icon_cache[project_id] = img_tk_local
+                label.config(image=img_tk_local)
+                label.image = img_tk_local
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 # ---------------------------
 #  MODRINTH-FENSTER
@@ -293,6 +329,7 @@ def open_modrinth_window():
     load_modrinth_page(state, scroll_frame, pagination_frame)
 
 def load_modrinth_page(state, parent_frame, pagination_frame):
+    # UI leeren
     for widget in parent_frame.winfo_children():
         widget.destroy()
 
@@ -300,198 +337,206 @@ def load_modrinth_page(state, parent_frame, pagination_frame):
     query = state["query"]
     page = state["page"]
     limit = state["limit"]
-
     offset = page * limit
 
-    # Facets für Kategorie
-    facets = f'[[\"project_type:{category}\"]]'
-    base_url = "https://api.modrinth.com/v2/search"
+    key = (category, query.strip(), page)
 
-    if not query.strip():
-        url = (
-            f"{base_url}?query=&facets={facets}"
-            f"&versions=[\"{MC_VERSION}\"]"
-            f"&index=downloads&limit={limit}&offset={offset}"
-        )
-    else:
-        url = (
-            f"{base_url}?query={query}"
-            f"&facets={facets}"
-            f"&versions=[\"{MC_VERSION}\"]"
-            f"&limit={limit}&offset={offset}"
-        )
+    def build_ui_from_data(data):
+        hits = data.get("hits", [])
+        total_hits = data.get("total_hits", len(hits))
+        pages = max(1, (total_hits + limit - 1) // limit)
+        state["pages"] = pages
 
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        messagebox.showerror("Fehler", f"Modrinth Anfrage fehlgeschlagen:\n{e}")
-        return
+        for hit in hits:
+            mod_id = hit["project_id"]
+            name = hit["title"]
+            desc = hit["description"]
+            icon_url = hit.get("icon_url")
+            downloads = hit.get("downloads", 0)
 
-    hits = data.get("hits", [])
-    total_hits = data.get("total_hits", len(hits))
-    pages = max(1, (total_hits + limit - 1) // limit)
-    state["pages"] = pages
+            frame = tk.Frame(parent_frame, bg="#1e1e1e", pady=10)
+            frame.pack(fill="x", padx=20, pady=10)
 
-    for hit in hits:
-        mod_id = hit["project_id"]
-        name = hit["title"]
-        desc = hit["description"]
-        icon_url = hit.get("icon_url")
-        downloads = hit.get("downloads", 0)
-
-        frame = tk.Frame(parent_frame, bg="#1e1e1e", pady=10)
-        frame.pack(fill="x", padx=20, pady=10)
-
-        # ICON LADEN
-        img_tk = None
-        if icon_url:
-            try:
-                img_data = requests.get(icon_url, timeout=10).content
-                img = Image.open(BytesIO(img_data)).resize((64, 64))
-                img_tk = ImageTk.PhotoImage(img)
-            except:
-                img_tk = None
-
-        if img_tk:
-            icon_label = tk.Label(frame, image=img_tk, bg="#1e1e1e")
-            icon_label.image = img_tk
+            # ICON-Label (wird async befüllt)
+            icon_label = tk.Label(frame, bg="#1e1e1e")
             icon_label.pack(side="left", padx=10)
 
-        text_frame = tk.Frame(frame, bg="#1e1e1e")
-        text_frame.pack(side="left", fill="x", expand=True)
+            # Icon async laden
+            load_icon_async(mod_id, icon_url, icon_label)
 
-        tk.Label(
-            text_frame,
-            text=name,
-            font=("Segoe UI", 16, "bold"),
-            fg="white",
-            bg="#1e1e1e"
-        ).pack(anchor="w")
+            text_frame = tk.Frame(frame, bg="#1e1e1e")
+            text_frame.pack(side="left", fill="x", expand=True)
 
-        tk.Label(
-            text_frame,
-            text=f"Downloads: {downloads:,}",
-            font=("Segoe UI", 10),
-            fg="#888888",
-            bg="#1e1e1e"
-        ).pack(anchor="w")
+            tk.Label(
+                text_frame,
+                text=name,
+                font=("Segoe UI", 16, "bold"),
+                fg="white",
+                bg="#1e1e1e"
+            ).pack(anchor="w")
 
-        tk.Label(
-            text_frame,
-            text=desc,
-            font=("Segoe UI", 12),
-            fg="#cccccc",
-            bg="#1e1e1e",
-            wraplength=800,
-            justify="left"
-        ).pack(anchor="w")
+            tk.Label(
+                text_frame,
+                text=f"Downloads: {downloads:,}",
+                font=("Segoe UI", 10),
+                fg="#888888",
+                bg="#1e1e1e"
+            ).pack(anchor="w")
 
-        def install_mod(mod_id=mod_id, name=name):
-            try:
-                versions = requests.get(
-                    f"https://api.modrinth.com/v2/project/{mod_id}/version",
-                    timeout=10
-                ).json()
+            tk.Label(
+                text_frame,
+                text=desc,
+                font=("Segoe UI", 12),
+                fg="#cccccc",
+                bg="#1e1e1e",
+                wraplength=800,
+                justify="left"
+            ).pack(anchor="w")
 
-                file = None
-                for v in versions:
-                    if MC_VERSION in v.get("game_versions", []):
-                        if v.get("files"):
-                            file = v["files"][0]
-                            break
+            def install_mod(mod_id=mod_id, name=name):
+                try:
+                    if mod_id in versions_cache:
+                        versions = versions_cache[mod_id]
+                    else:
+                        versions = requests.get(
+                            f"https://api.modrinth.com/v2/project/{mod_id}/version",
+                            timeout=10
+                        ).json()
+                        versions_cache[mod_id] = versions
 
-                if not file:
-                    messagebox.showerror("Fehler", "Keine Version für deine Minecraft-Version gefunden.")
-                    return
+                    file = None
+                    for v in versions:
+                        if MC_VERSION in v.get("game_versions", []):
+                            if v.get("files"):
+                                file = v["files"][0]
+                                break
 
-                file_url = file["url"]
-                file_name = file["filename"]
+                    if not file:
+                        messagebox.showerror("Fehler", "Keine Version für deine Minecraft-Version gefunden.")
+                        return
 
-                mods_folder = os.path.join(os.getcwd(), ".minecraft", "mods")
-                os.makedirs(mods_folder, exist_ok=True)
+                    file_url = file["url"]
+                    file_name = file["filename"]
 
-                file_data = requests.get(file_url, timeout=20).content
-                with open(os.path.join(mods_folder, file_name), "wb") as f:
-                    f.write(file_data)
+                    mods_folder = os.path.join(os.getcwd(), ".minecraft", "mods")
+                    os.makedirs(mods_folder, exist_ok=True)
 
-                messagebox.showinfo("Installiert", f"{name} wurde installiert!")
-                if not logging_enabled:
-                    show_content_list()
-            except Exception as e:
-                messagebox.showerror("Fehler", f"Installation fehlgeschlagen:\n{e}")
+                    file_data = requests.get(file_url, timeout=20).content
+                    with open(os.path.join(mods_folder, file_name), "wb") as f:
+                        f.write(file_data)
 
-        install_button = tk.Button(
-            frame,
-            text="Installieren",
-            font=("Segoe UI", 12),
-            bg="#4CAF50",
-            fg="white",
-            activebackground="#449d48",
-            activeforeground="white",
-            command=install_mod
-        )
-        install_button.pack(side="right", padx=20)
+                    messagebox.showinfo("Installiert", f"{name} wurde installiert!")
+                    if not logging_enabled:
+                        show_content_list()
+                except Exception as e:
+                    messagebox.showerror("Fehler", f"Installation fehlgeschlagen:\n{e}")
 
-    # Pagination-UI neu aufbauen
-    for w in pagination_frame.winfo_children():
-        w.destroy()
+            install_button = tk.Button(
+                frame,
+                text="Installieren",
+                font=("Segoe UI", 12),
+                bg="#4CAF50",
+                fg="white",
+                activebackground="#449d48",
+                activeforeground="white",
+                command=install_mod
+            )
+            install_button.pack(side="right", padx=20)
 
-    def go_page(p):
-        if 0 <= p < state["pages"]:
-            state["page"] = p
-            load_modrinth_page(state, parent_frame, pagination_frame)
+        # Pagination-UI neu aufbauen
+        for w in pagination_frame.winfo_children():
+            w.destroy()
 
-    # Zurück
-    prev_btn = tk.Button(
-        pagination_frame,
-        text="«",
-        font=("Segoe UI", 12),
-        bg="#333333",
-        fg="white",
-        bd=0,
-        relief="flat",
-        command=lambda: go_page(state["page"] - 1)
-    )
-    prev_btn.pack(side="left", padx=5)
+        def go_page(p):
+            if 0 <= p < state["pages"]:
+                state["page"] = p
+                load_modrinth_page(state, parent_frame, pagination_frame)
 
-    # Seitenzahlen (max 10 anzeigen)
-    max_buttons = min(10, pages)
-    start_page = max(0, min(state["page"] - 4, pages - max_buttons))
-    end_page = start_page + max_buttons
-
-    for p in range(start_page, end_page):
-        txt = str(p + 1)
-        if p == state["page"]:
-            bg = "#3a8dde"
-        else:
-            bg = "#333333"
-        b = tk.Button(
+        prev_btn = tk.Button(
             pagination_frame,
-            text=txt,
+            text="«",
             font=("Segoe UI", 12),
-            bg=bg,
+            bg="#333333",
             fg="white",
             bd=0,
             relief="flat",
-            width=3,
-            command=lambda pp=p: go_page(pp)
+            command=lambda: go_page(state["page"] - 1)
         )
-        b.pack(side="left", padx=2)
+        prev_btn.pack(side="left", padx=5)
 
-    # Weiter
-    next_btn = tk.Button(
-        pagination_frame,
-        text="»",
-        font=("Segoe UI", 12),
-        bg="#333333",
-        fg="white",
-        bd=0,
-        relief="flat",
-        command=lambda: go_page(state["page"] + 1)
-    )
-    next_btn.pack(side="left", padx=5)
+        max_buttons = min(10, pages)
+        start_page = max(0, min(state["page"] - 4, pages - max_buttons))
+        end_page = start_page + max_buttons
+
+        for p in range(start_page, end_page):
+            txt = str(p + 1)
+            bg = "#3a8dde" if p == state["page"] else "#333333"
+            b = tk.Button(
+                pagination_frame,
+                text=txt,
+                font=("Segoe UI", 12),
+                bg=bg,
+                fg="white",
+                bd=0,
+                relief="flat",
+                width=3,
+                command=lambda pp=p: go_page(pp)
+            )
+            b.pack(side="left", padx=2)
+
+        next_btn = tk.Button(
+            pagination_frame,
+            text="»",
+            font=("Segoe UI", 12),
+            bg="#333333",
+            fg="white",
+            bd=0,
+            relief="flat",
+            command=lambda: go_page(state["page"] + 1)
+        )
+        next_btn.pack(side="left", padx=5)
+
+    # Wenn Seite im Cache → direkt UI bauen
+    if key in page_cache:
+        build_ui_from_data(page_cache[key])
+        return
+
+    # Sonst: im Thread laden
+    def worker():
+        base_url = "https://api.modrinth.com/v2/search"
+        facets = f'[[\"project_type:{category}\"]]'
+        if not query.strip():
+            url = (
+                f"{base_url}?query=&facets={facets}"
+                f"&versions=[\"{MC_VERSION}\"]"
+                f"&index=downloads&limit={limit}&offset={offset}"
+            )
+        else:
+            url = (
+                f"{base_url}?query={query}"
+                f"&facets={facets}"
+                f"&versions=[\"{MC_VERSION}\"]"
+                f"&limit={limit}&offset={offset}"
+            )
+
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            def err():
+                messagebox.showerror("Fehler", f"Modrinth Anfrage fehlgeschlagen:\n{e}")
+            root.after(0, err)
+            return
+
+        page_cache[key] = data
+
+        def apply():
+            build_ui_from_data(data)
+
+        root.after(0, apply)
+
+    threading.Thread(target=worker, daemon=True).start()
 
 # ---------------------------
 #  UI
@@ -596,5 +641,6 @@ try:
     root.mainloop()
 except Exception as e:
     messagebox.showerror("Launcher Fehler", str(e))
-
     raise
+
+
